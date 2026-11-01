@@ -1,5 +1,16 @@
 # Slug Ai
 
+wire.py
+/host
+/controller
+
+# Setup
+
+Run
+```
+uv sync
+```
+
 
 # Rules
 

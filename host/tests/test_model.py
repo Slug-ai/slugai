@@ -1,9 +1,10 @@
 import mlx.core as mx
 import pytest
+from mlx.utils import tree_flatten
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.utils import load_model
 
-from host.model import Shard, model_path
+from host.model import Shard, model_path, size
 
 PROMPTS = [[5, 9, 3, 7, 1, 12], [4, 2], [8, 8, 30, 2, 2, 2, 2, 2, 11]]
 
@@ -69,3 +70,20 @@ def test_tokens_match_mlx_lm(tiny_model):
 def test_layers_outside_the_model(tiny_model):
     with pytest.raises(ValueError):
         Shard(tiny_model, 2, num_layers(tiny_model) + 1)
+
+
+def test_size_matches_the_weights_and_caches(tiny_model):
+    s, n = size(tiny_model), num_layers(tiny_model)
+    on_disk = mx.load(f"{tiny_model}/model.safetensors")  # unread: shapes only
+
+    def total(prefix: str) -> int:
+        return sum(a.nbytes for k, a in on_disk.items() if k.startswith(prefix))
+
+    assert s["layer_bytes"] * n == pytest.approx(total("model.layers."), abs=n)
+    assert s["embed_bytes"] == total("model.embed_tokens.")
+    assert s["head_bytes"] == total("model.norm.") + (total("lm_head.") or s["embed_bytes"])  # tied: the embedding
+    shard = Shard(tiny_model, 0, n)
+    cache = shard.new_cache(3)
+    shard.forward(mx.zeros((3, 10), mx.int32), cache, [10, 10, 10])  # caches grow in blocks of 256 tokens
+    held = sum(a.nbytes for c in cache for _, a in tree_flatten(c.state) if isinstance(a, mx.array))
+    assert held == pytest.approx(n * 3 * (s["kv_bytes"] * 256 + s["state_bytes"]), rel=0.01)

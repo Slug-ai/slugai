@@ -57,7 +57,8 @@ async def ring(model: str, layers: list[tuple]) -> dict[int, list[list[int]]]:
 def test_ring_matches_one_shard(tiny_model):
     """Three hosts, the middle one streaming its layers, two micro-batches in flight: one shard's tokens."""
     n = num_layers(tiny_model)
-    got = asyncio.run(ring(tiny_model, [(0, 2, None), (2, n - 1, 0), (n - 1, n, None)]))
+    # a timeout: a host that fails reports it on its own connection, which leaves the ring waiting
+    got = asyncio.run(asyncio.wait_for(ring(tiny_model, [(0, 2, None), (2, n - 1, 0), (n - 1, n, None)]), 30))
     whole = Shard(tiny_model, 0, n)
     for slot, prompts in BATCHES.items():
         assert got[slot] == mx.argmax(mx.stack(generate([whole], prompts, STEPS), 1), -1).tolist()
@@ -85,5 +86,20 @@ def test_requests(tiny_model):
         writer.close()  # the controller leaving unloads the shard
         while host.shard is not None:
             await asyncio.sleep(0.01)
+
+    asyncio.run(asyncio.wait_for(run(), 30))
+
+
+def test_frames_from_an_old_plan_are_dropped(tiny_model):
+    async def run():
+        ((_, address),) = await start_hosts(1)
+        reader, writer = await wire.connect(address)
+        await wire.send(writer, {"type": "load", "model": tiny_model, "start": 0, "end": num_layers(tiny_model), "epoch": 2})
+        assert (await recv(reader))[0]["type"] == "loaded"
+        x = np.array([[1, 2, 3]], np.int32)
+        await wire.send(writer, {"type": "forward", "slot": 0, "lengths": [3], "epoch": 1}, x)
+        await wire.send(writer, {"type": "forward", "slot": 0, "lengths": [3], "epoch": 2}, x)
+        msg, _ = await recv(reader)
+        assert msg["type"] == "tokens" and msg["epoch"] == 2
 
     asyncio.run(asyncio.wait_for(run(), 30))

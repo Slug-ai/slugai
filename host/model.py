@@ -28,14 +28,45 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_map, tree_unflatten
-from mlx_lm.models.cache import make_prompt_cache
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx_lm.models.cache import KVCache, make_prompt_cache
 from mlx_lm.utils import _download, load_config, load_model, load_tokenizer
 
 
 def model_path(model: str) -> Path:
     """A local model directory, or a Hugging Face repo id (downloaded on first use)."""
     return _download(str(model))
+
+
+def size(model: str) -> dict:
+    """The model's sizes in bytes, for planning: weights per layer, the first shard's embedding,
+    the last shard's head, and cache per layer per token and per sequence (linear attention's state).
+
+    From a lazy model, so shapes are known without reading or computing anything.
+    """
+    m, _ = load_model(model_path(model), lazy=True)
+    inner, n = m.model, len(m.model.layers)
+
+    def nbytes(module: nn.Module) -> int:
+        return sum(a.nbytes for _, a in tree_flatten(module.parameters()))
+
+    def cache_bytes(tokens: int) -> int:  # one sequence's cache after ``tokens`` tokens
+        cache = make_prompt_cache(m)
+        inner(mx.zeros((1, tokens), mx.int32), cache=cache)
+        return sum(a.nbytes for c in cache for _, a in tree_flatten(c.state) if isinstance(a, mx.array))
+
+    block = KVCache.step  # caches grow in blocks of this many tokens
+    one, two = cache_bytes(1), cache_bytes(1 + block)
+    kv = (two - one) // block
+    head = m.lm_head if hasattr(m, "lm_head") else inner.embed_tokens  # tied models use the embedding
+    return {
+        "layers": n,
+        "layer_bytes": sum(nbytes(l) for l in inner.layers) // n,
+        "embed_bytes": nbytes(inner.embed_tokens),
+        "head_bytes": nbytes(inner.norm) + nbytes(head),
+        "kv_bytes": kv // n,
+        "state_bytes": (one - kv * block) // n,
+    }
 
 
 class Shard:

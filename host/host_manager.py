@@ -3,9 +3,10 @@
 The controller sends requests, each answered on the same connection (a failure
 answers ``error {message}``):
 
+* ``size {model}`` → ``size {layers, layer_bytes, embed_bytes, head_bytes, kv_bytes, state_bytes}``
 * ``profile {model, context, batch_sizes}`` → ``profile {layer_time, free_memory, disk_speed}``
-* ``load {model, start, end, resident, next}`` → ``loaded {seconds, memory}``: hold layers
-  [start, end) and send outputs to ``next`` (``host:port``); the last shard has no next
+* ``load {model, start, end, resident, next, epoch}`` → ``loaded {seconds, memory}``: hold
+  layers [start, end) and send outputs to ``next`` (``host:port``); the last shard has no next
 * ``unload`` → ``unloaded``
 
 Micro-batches come from the controller (to the first host) or the previous
@@ -15,7 +16,8 @@ marks a prefill of right-padded prompts, which starts the slot's cache afresh.
 The output goes on as the same message to the next host or, from the last
 host, as ``tokens {slot, lengths, ...}`` + each row's greedy next token to the
 controller. Other fields ride along, so the controller can tell what each
-``tokens`` answers.
+``tokens`` answers. Frames whose ``epoch`` isn't the last load's are from an
+old plan, and are dropped.
 
 Every second the host pushes ``stats {busy, steps, memory}`` to the
 controller; they double as heartbeats. All MLX work runs on one thread, so the
@@ -40,7 +42,7 @@ from mlx_lm.utils import maybe_set_recommended_wired_limit
 
 import wire
 
-from .model import Shard
+from .model import Shard, size
 from .profile import BATCH_SIZES, profile
 
 
@@ -48,6 +50,7 @@ class HostManager:
     def __init__(self, stats_every: float = 1.0):
         self.stats_every = stats_every
         self.shard: Shard | None = None
+        self.epoch = None  # the last load's: forward frames from any other are dropped
         self.caches: dict = {}  # slot -> its cache
         self.controller: asyncio.StreamWriter | None = None
         self.next: asyncio.StreamWriter | None = None
@@ -69,7 +72,8 @@ class HostManager:
             while True:
                 msg, array = await wire.recv(reader)
                 if msg["type"] == "forward":
-                    self.work.put_nowait((msg, array))
+                    if msg.get("epoch") == self.epoch:
+                        self.work.put_nowait((msg, array))
                 else:
                     self.controller = writer
                     await wire.send(writer, await self.request(msg))
@@ -83,8 +87,10 @@ class HostManager:
 
     async def request(self, msg: dict) -> dict:
         try:
+            if msg["type"] == "size":
+                return {"type": "size", **await self.run(size, msg["model"])}
             if msg["type"] == "profile":
-                p = await self.run(profile, msg["model"], msg.get("context", 64), tuple(msg.get("batch_sizes", BATCH_SIZES)))
+                p = await self.run(profile, msg["model"], msg.get("context") or 64, tuple(msg.get("batch_sizes") or BATCH_SIZES))
                 return {"type": "profile", **asdict(p)}
             if msg["type"] == "load":
                 return {"type": "loaded", **await self.load(msg)}
@@ -96,6 +102,7 @@ class HostManager:
             return {"type": "error", "message": f"{type(e).__name__}: {e}"}
 
     async def load(self, msg: dict) -> dict:
+        self.epoch = msg.get("epoch")  # first, so frames arriving while it loads are filtered
         await self.unload()
         t0 = time.perf_counter()
         shard = await self.run(Shard, msg["model"], msg["start"], msg["end"], msg.get("resident"))
@@ -133,7 +140,7 @@ class HostManager:
             try:
                 out, last = await self.run(self.step, msg, x)
             except Exception as e:
-                await self.error(msg, e)
+                await self.tell_controller({"type": "error", "slot": msg.get("slot"), "message": f"{type(e).__name__}: {e}"})
                 continue
             self.busy += time.perf_counter() - t0
             self.steps += 1
@@ -146,11 +153,8 @@ class HostManager:
             writer, msg, out = await self.outbox.get()
             try:
                 await wire.send(writer, msg, out)
-            except ConnectionError as e:
-                await self.error(msg, e)
-
-    async def error(self, msg: dict, e: Exception) -> None:
-        await self.tell_controller({"type": "error", "slot": msg.get("slot"), "message": f"{type(e).__name__}: {e}"})
+            except ConnectionError:
+                pass  # the next host is gone: the controller sees it drop and plans again
 
     async def push_stats(self) -> None:
         last = time.perf_counter()

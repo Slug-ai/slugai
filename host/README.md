@@ -2,11 +2,6 @@
 
 Code that runs on hosts, ie, the macbooks, gaming pcs, GPUs, etc.
 
-Setup using (from repo route)
-```
-uv sync
-```
-
 # Files
 
 profile.py:
@@ -23,3 +18,11 @@ layers is the ranges you want to run
 resident is layers in resident
 prompt / tokens is the input prompt
 - Test using ```uv run pytest host/tests/test_model.py```
+
+
+host_manager.py:
+The host process. Loads a shard when the controller asks, runs each micro-batch sent to it, passes the output to the next host (the last host sends tokens to the controller), and pushes stats every second
+- Run using ```uv run python -m host.host_manager --port 47111```
+port is where the controller and the previous host connect
+- Test using ```uv run pytest host/tests/test_host_manager.py```
+Question for later: should we connect from each node to the centeral or to each other directly? should central node be owned by us?
