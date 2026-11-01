@@ -1,11 +1,12 @@
 # Controller
 
-Code that runs the job: talks to every host, plans the split of layers, feeds prompts through and collects completions.
+Code that runs the job on a centeral control plane.
+It will talks to every host, plans the split of layers, feeds prompts through and collects completions.
 
 # Files
 
 controller.py:
-Runs a job. Profiles each host, plans, loads the plan onto the hosts, streams the prompts through and writes outputs/<job>-completions.jsonl and outputs/<job>-report.json. Drops a host that goes silent and replans on the rest
+Runs the entire job e2e (profile + plan + load plan to host + stream prompts + save outputs) 
 - Run using ```uv run python -m controller.controller --model mlx-community/Qwen3-8B-4bit --hosts mac1:47111,mac2:47111 --prompts prompts.txt --max-tokens 128```
 model is HF repo id (the same on every host)
 hosts is host:port of each host, in pipeline order
@@ -17,7 +18,7 @@ job names the output files
 
 
 plan.py:
-Takes the model size and each host's profile and decides the split: which layers go on which host, how many stay in memory (the rest stream from disk), the micro-batch size and how many slots. Picks the split where the slowest host is fastest. Doesn't account for network speed yet
+Takes the model size and each host's profile (from the profiling) and decides the split: which layers go on which host, how many stay in memory (the rest stream from disk), the micro-batch size and how many slots. Picks the split where the slowest host is fastest. Doesn't account for network speed yet
 - Test using ```uv run pytest controller/tests/test_plan.py```
 
 
