@@ -10,7 +10,7 @@ Has packet networking code shared between both controller and host
 Code for each machine to run (profile myself, run a model myself, and pass on the data)
 
 /controller
-Code for centeral controller (determine everyones model split based on profiles, send out batches)
+Code for centeral controller (determine everyones model split + if weight streaming is needed based on profiles, send out batches)
 
 # Setup
 
