@@ -7,8 +7,9 @@ from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.utils import load_model
 
 from controller.controller import Controller, save
+from controller.plan import BLOCK
 from host.host_manager import HostManager
-from host.model import model_path
+from host.model import model_path, size
 
 PROMPTS = [[5, 9, 3, 7, 1, 12], [4, 2], [8, 8, 30, 2, 2, 11], [6], [13, 14, 15], [40, 41, 42, 43, 44, 45, 46], [9, 9]]
 EOS = {2}
@@ -46,6 +47,24 @@ def test_job_matches_mlx_lm(tiny_model, tmp_path, monkeypatch):
     completions, report = save("job", controller, decode=lambda tokens: " ".join(map(str, tokens)))
     assert [json.loads(line)["tokens"] for line in completions.read_text().splitlines()] == [s.tokens for s in sequences]
     assert json.loads(report.read_text())["tokens"] == sum(len(s.tokens) for s in sequences)
+
+
+def test_a_model_too_big_for_its_host_streams(tiny_model, monkeypatch):
+    """The host says it has room for the caches and three layers: one to keep, two to stream the rest through."""
+    s = size(tiny_model)
+    caches = s["layers"] * (s["kv_bytes"] * BLOCK + s["state_bytes"])  # one sequence at a time; these jobs fit one block
+    free = s["embed_bytes"] + s["head_bytes"] + caches + 3 * s["layer_bytes"]
+    monkeypatch.setattr("host.profile.free_memory", lambda: free)
+
+    async def run():
+        _, addresses = await start_hosts(1)
+        controller = Controller(tiny_model, addresses, PROMPTS, max_tokens=6, eos=EOS, slots=1, batch_sizes=[1, 2, 4])
+        return controller, await controller.run()
+
+    controller, sequences = asyncio.run(asyncio.wait_for(run(), 60))
+    (stage,) = controller.plan.stages
+    assert stage.resident < s["layers"]  # the plan streams the layers that don't fit
+    assert [q.tokens for q in sequences] == reference(tiny_model, 6)
 
 
 def test_a_host_that_stops_is_planned_around(tiny_model):
