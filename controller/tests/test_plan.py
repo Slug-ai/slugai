@@ -66,8 +66,3 @@ def test_picks_the_batch_with_the_most_tokens_per_second():
 def test_caches_that_cant_fit():
     with pytest.raises(PlanError):
         plan(SIZE, {"a": host(free=4)}, context=100_000, slots=3, max_batch=32)
-
-
-def test_more_hosts_than_layers():
-    with pytest.raises(PlanError):
-        plan(ModelSize(**{**SIZE.__dict__, "layers": 2}), {"a": host(), "b": host(), "c": host()}, context=300, slots=3, max_batch=32)

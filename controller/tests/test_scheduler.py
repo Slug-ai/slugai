@@ -32,5 +32,5 @@ def test_requeued_sequences_resume_from_their_tokens():
     s.start(0, 2)
     s.advance(0, [7, 9])
     s.requeue()  # row 1 is done; row 0 goes back, ahead of prompt 2
-    assert [seq.id for seq in s.queue] == [0, 2] and not s.slots
+    assert [seq.id for seq in s.waiting] == [0, 2] and not s.slots
     assert arrays(s.start(0, 1))[0] == ({"type": "forward", "slot": 0, "lengths": [2]}, [[1, 2]])  # context 1 2 7: prefill 1 2

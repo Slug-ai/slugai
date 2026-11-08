@@ -7,6 +7,10 @@ step's input. When a host drops (its connection closes or its stats stop),
 the controller plans again on the hosts left, loads that plan under a new
 epoch (hosts drop frames from the old one) and restarts the slots from the
 tokens the scheduler holds.
+
+Given a ``context``, the controller serves instead (controller/serve.py): it
+keeps running, taking prompts from ``submit``, and an idle slot starts as soon
+as one comes in.
 """
 
 from __future__ import annotations
@@ -76,11 +80,17 @@ class Controller:
         slots: int | None = None,
         batch_sizes: list[int] | None = None,
         timeout: float = 10.0,
+        context: int | None = None,
     ):
         """``hosts``: ``host:port`` each, in pipeline order. ``slots``: micro-batches in flight (default: one per host, plus one).
-        ``batch_sizes``: what hosts profile (default: theirs). ``timeout``: seconds without a word before a host has dropped."""
+        ``batch_sizes``: what hosts profile (default: theirs). ``timeout``: seconds without a word before a host has dropped.
+        ``context``: serve, taking prompts from ``submit`` with up to this many tokens each (prompt plus completion), instead of running ``prompts`` to the end."""
         self.model, self.hosts, self.max_tokens, self.slots, self.batch_sizes, self.timeout = model, hosts, max_tokens, slots, batch_sizes, timeout
+        self.serving, self.context = context is not None, context
+        self.ready = False  # a plan is loaded and its slots started
+        self.on_step: Callable[[list[Sequence]], None] = lambda seqs: None  # after each decode step, with its slot's sequences
         self.scheduler = Scheduler(prompts, max_tokens, eos)
+        self.queue = self.scheduler  # the API's name for it (slug_api.Backend)
         self.events: asyncio.Queue = asyncio.Queue()  # (host, message, array) from every link
         self.links: dict[str, Link] = {}
         self.stats: dict[str, dict] = {}  # host -> its latest stats
@@ -95,7 +105,7 @@ class Controller:
         await self.measure()
         await self.apply()
         self.started = shown = time.monotonic()  # time the job from here, after profiling and loading
-        while not self.scheduler.finished:
+        while self.serving or not self.scheduler.finished:
             try:
                 await self.handle(*await asyncio.wait_for(self.events.get(), self.timeout / 4))
             except TimeoutError:
@@ -114,20 +124,28 @@ class Controller:
         first = self.links[self.hosts[0]]
         self.size = ModelSize(**await first.ask({"type": "size", "model": self.model}))
         lengths = [len(s.prompt) for s in self.scheduler.sequences]
-        ask = {"type": "profile", "model": self.model, "context": int(statistics.mean(lengths)) + self.max_tokens // 2, "batch_sizes": self.batch_sizes}
+        typical = self.context // 2 if self.serving else int(statistics.mean(lengths)) + self.max_tokens // 2
+        ask = {"type": "profile", "model": self.model, "context": typical, "batch_sizes": self.batch_sizes}
         self.profiles = {}
         for host, link in self.links.items():  # one at a time: hosts sharing a Mac would skew each other's
             p = await link.ask(ask)
             self.profiles[host] = HostProfile({int(b): t for b, t in p["layer_time"].items()}, p["free_memory"], p["disk_speed"])
-        self.context = max(lengths) + self.max_tokens  # the longest any cache gets
+        if not self.serving:
+            self.context = max(lengths) + self.max_tokens  # the longest any cache gets
 
     async def apply(self) -> None:
         """Plan on the hosts left, load the plan under a new epoch and start every slot."""
-        if self.scheduler.finished:
+        if self.scheduler.finished and not self.serving:
             return
+        self.ready = False
         self.epoch += 1
-        slots = min(self.slots or len(self.links) + 1, len(self.scheduler.queue))
-        self.plan = plan(self.size, {h: self.profiles[h] for h in self.links}, self.context, slots, math.ceil(len(self.scheduler.queue) / slots))
+        slots = self.slots or len(self.links) + 1
+        if self.serving:
+            max_batch = max(b for p in self.profiles.values() for b in p.layer_time)  # any profiled size: the plan picks the fastest
+        else:
+            slots = min(slots, len(self.scheduler.waiting))
+            max_batch = math.ceil(len(self.scheduler.waiting) / slots)
+        self.plan = plan(self.size, {h: self.profiles[h] for h in self.links}, self.context, slots, max_batch)
         stages = self.plan.stages
         hosts = ", ".join(f"{s.host} layers {s.start}-{s.end - 1} ({s.resident} in memory)" for s in stages)
         print(f"plan {self.epoch}: {self.plan.slots} x {self.plan.batch} sequences, ~{self.plan.tokens_per_second:.1f} tok/s; {hosts}", flush=True)
@@ -136,8 +154,20 @@ class Controller:
             for s, nxt in zip(stages, stages[1:] + [None])
         ))
         self.first = self.links[stages[0].host]
-        for slot in range(self.plan.slots):
-            await self.feed(self.scheduler.start(slot, self.plan.batch))
+        self.ready = True
+        await self.fill()
+
+    async def fill(self) -> None:
+        """Start every idle slot on queued sequences (once a plan is loaded)."""
+        for slot in range(self.plan.slots if self.ready else 0):
+            if self.ready and slot not in self.scheduler.slots:
+                await self.feed(self.scheduler.start(slot, self.plan.batch))
+
+    async def submit(self, prompt: list[int], max_tokens: int | None = None) -> Sequence:
+        """Queue a prompt while serving; it starts as soon as a slot is free."""
+        seq = self.scheduler.add(prompt, max_tokens)
+        await self.fill()
+        return seq
 
     async def handle(self, host: str, msg: dict, array: np.ndarray | None) -> None:
         if msg["type"] == "stats":
@@ -147,12 +177,16 @@ class Controller:
         elif msg["type"] == "error":
             raise RuntimeError(f"{host}: {msg['message']}")
         elif msg.get("epoch") == self.epoch and "lengths" not in msg:  # a prefill's tokens follow cut-short prompts
-            await self.feed(self.scheduler.advance(msg["slot"], array.tolist()))
+            seqs = self.scheduler.slots[msg["slot"]]
+            frames = self.scheduler.advance(msg["slot"], array.tolist())
+            self.on_step(seqs)
+            await self.feed(frames)
 
     async def feed(self, frames: list[Frame]) -> None:
+        first, epoch = self.first, self.epoch  # a new plan while sending: hosts drop the rest
         try:
             for msg, x in frames:
-                await wire.send(self.first.writer, {**msg, "epoch": self.epoch}, x)
+                await wire.send(first.writer, {**msg, "epoch": epoch}, x)
         except ConnectionError:
             pass  # the first host is gone: it's about to drop
 
@@ -198,6 +232,18 @@ def load_tokenizer(model: str):
     return tok, {tok.eos_token_id, *(eos if isinstance(eos, list) else [eos])} - {None}
 
 
+def encoder(tok) -> Callable[[list[dict]], list[int]]:
+    """Turns chat messages (``{"role", "content"}`` each) into token ids: instruct models get their chat template."""
+
+    def encode(messages: list[dict]) -> list[int]:
+        if tok.chat_template:
+            text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            return tok.encode(text, add_special_tokens=False)
+        return tok.encode("\n".join(m["content"] for m in messages))
+
+    return encode
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Run a job across hosts and write its completions and report to outputs/.")
     p.add_argument("--model", required=True, help="Hugging Face repo id or local model directory (the same on every host)")
@@ -209,14 +255,8 @@ def main() -> None:
     args = p.parse_args()
 
     tok, eos = load_tokenizer(args.model)
-
-    def encode(text: str) -> list[int]:  # instruct models get their chat template
-        if tok.chat_template:
-            text = tok.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True)
-            return tok.encode(text, add_special_tokens=False)
-        return tok.encode(text)
-
-    prompts = [encode(t) for t in read_prompts(args.prompts)]
+    encode = encoder(tok)
+    prompts = [encode([{"role": "user", "content": t}]) for t in read_prompts(args.prompts)]
     controller = Controller(args.model, args.hosts.split(","), prompts, args.max_tokens, eos, args.slots)
     asyncio.run(controller.run())
     print(controller.status())

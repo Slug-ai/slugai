@@ -13,36 +13,30 @@ plan: a sequence's context is its prompt plus what it has generated so far.
 
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass, field
-
 import numpy as np
+from slug_api import Queue, Sequence
 
 Frame = tuple[dict, np.ndarray]  # a forward message and its token ids
 
 
-@dataclass
-class Sequence:
-    id: int
-    prompt: list[int]
-    tokens: list[int] = field(default_factory=list)  # generated so far
-    done: bool = False
+class Scheduler(Queue):
+    """A ``Queue`` (requests in line, prompts given here first) that also hands them out to slots."""
 
-
-class Scheduler:
     def __init__(self, prompts: list[list[int]], max_tokens: int, eos: set[int]):
-        self.max_tokens, self.eos = max_tokens, eos
-        self.sequences = [Sequence(i, p) for i, p in enumerate(prompts)]
-        self.queue = deque(self.sequences)
+        super().__init__(max_tokens, eos)
+        for prompt in prompts:
+            self.add(prompt)
         self.slots: dict[int, list[Sequence]] = {}
+        self.widths: dict[int, int] = {}  # slot -> sequences it takes
 
     @property
     def finished(self) -> bool:
-        return not self.queue and not self.slots
+        return not self.waiting and not self.slots
 
     def start(self, slot: int, batch: int) -> list[Frame]:
         """Put up to ``batch`` queued sequences in ``slot``: the frames that start it (none if the queue is empty)."""
-        seqs = [self.queue.popleft() for _ in range(min(batch, len(self.queue)))]
+        self.widths[slot] = batch
+        seqs = [self.waiting.popleft() for _ in range(min(batch, len(self.waiting)))]
         if not seqs:
             return []
         self.slots[slot] = seqs
@@ -59,14 +53,14 @@ class Scheduler:
         for s, t in zip(seqs, tokens):
             if not s.done:
                 s.tokens.append(t)
-                s.done = t in self.eos or len(s.tokens) >= self.max_tokens
+                s.done = t in self.eos or len(s.tokens) >= s.max_tokens
         if not all(s.done for s in seqs):
             return [({"type": "forward", "slot": slot}, np.array(tokens, np.int32)[:, None])]
         del self.slots[slot]
-        return self.start(slot, len(seqs))
+        return self.start(slot, self.widths[slot])
 
     def requeue(self) -> None:
         """Put every unfinished sequence in a slot back at the front of the queue, keeping its tokens (for a new plan)."""
         running = [s for seqs in self.slots.values() for s in seqs if not s.done]
-        self.queue.extendleft(reversed(sorted(running, key=lambda s: s.id)))
+        self.waiting.extendleft(reversed(sorted(running, key=lambda s: s.id)))
         self.slots.clear()
