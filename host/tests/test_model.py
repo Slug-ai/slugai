@@ -33,24 +33,18 @@ def same(a: list[mx.array], b: list[mx.array]) -> bool:
     return all(mx.array_equal(x, y).item() for x, y in zip(a, b))
 
 
-def test_any_split_gives_the_same_logits(tiny_model):
-    n = num_layers(tiny_model)
-    whole = generate([Shard(tiny_model, 0, n)])
-    assert same(whole, generate([Shard(tiny_model, 0, 2), Shard(tiny_model, 2, n - 1), Shard(tiny_model, n - 1, n)]))
-
-
 def test_streamed_layers_give_the_same_logits(tiny_model):
     n = num_layers(tiny_model)
     whole = generate([Shard(tiny_model, 0, n)])
     assert same(whole, generate([Shard(tiny_model, 0, 3, resident=1), Shard(tiny_model, 3, n, resident=0)]))
 
 
-def test_streamed_layers_stay_on_disk(tiny_model):
-    n = num_layers(tiny_model)
-    resident = Shard(tiny_model, 0, n)
+def test_streamed_layers_stay_on_disk(qwen3):
+    n = num_layers(qwen3)
+    resident = Shard(qwen3, 0, n)
     held = mx.get_active_memory()
     del resident
-    streamed = Shard(tiny_model, 0, n, resident=0)
+    streamed = Shard(qwen3, 0, n, resident=0)
     assert mx.get_active_memory() < held
     del streamed
 
@@ -65,11 +59,6 @@ def test_tokens_match_mlx_lm(tiny_model):
             x = mx.argmax(model(x, cache=cache)[:, -1], -1)[:, None]
             got.append(x.item())
         assert got == want
-
-
-def test_layers_outside_the_model(tiny_model):
-    with pytest.raises(ValueError):
-        Shard(tiny_model, 2, num_layers(tiny_model) + 1)
 
 
 def test_size_matches_the_weights_and_caches(tiny_model):

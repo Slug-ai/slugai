@@ -69,4 +69,11 @@ def build(path: Path, arch, config: dict, dtype) -> Path:
 
 @pytest.fixture(scope="session", params=MODELS)
 def tiny_model(request, tmp_path_factory) -> str:
+    """Every architecture: for code that depends on one."""
     return str(build(tmp_path_factory.mktemp("models") / request.param, *MODELS[request.param]))
+
+
+@pytest.fixture(scope="session")
+def qwen3(tmp_path_factory) -> str:
+    """One architecture: for code that doesn't depend on it."""
+    return str(build(tmp_path_factory.mktemp("models") / "qwen3", *MODELS["qwen3"]))

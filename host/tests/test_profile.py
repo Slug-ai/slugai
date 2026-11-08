@@ -3,8 +3,8 @@ import mlx.core as mx
 from host.profile import profile
 
 
-def test_profile(tiny_model):
-    p = profile(tiny_model, context=16, batch_sizes=(8, 1, 4))
+def test_profile(qwen3):
+    p = profile(qwen3, context=16, batch_sizes=(8, 1, 4))
     assert list(p.layer_time) == [1, 4, 8]
     times = list(p.layer_time.values())
     assert times[0] > 0 and times == sorted(times)
